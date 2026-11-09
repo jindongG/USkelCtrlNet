@@ -24,12 +24,9 @@ parser.add_argument("-down_layer", type=str, default="MaxPooling")#DeformDown  M
 parser.add_argument("-rate", type=int, default=72)
 parser.add_argument("-repeat_n", type=int, default=1)
 
-parser.add_argument('--alpha', type=float, default=0.6)
+parser.add_argument('--alpha', type=float, default=0.7)
 parser.add_argument('--beta', type=float, default=0.25)
-parser.add_argument('--gamma', type=float, default=0.1)
-parser.add_argument('--delta', type=float, default=0.05)
-parser.add_argument('--ohem_weight', type=float, default=0.5)
-parser.add_argument('--ohem_top_percent', type=float, default=0.25)#0.25
+parser.add_argument('--gamma', type=float, default=0.05)
 
 parser.add_argument("--eval_thr", type=float, default=0.5,
                     help="Threshold for binarizing pred_prob during evaluation (probability space).")

@@ -29,7 +29,7 @@ The figures below summarize OCTA-500 performance for vessel-related tasks and FA
 |-- models/USkelCtrlUnet.py      # USkelCtrlNet model definition
 |-- conversion_and_visualize.py  # Convert saved prediction arrays to visual results
 |-- dataset.py                   # OCTA-500 dataset and split loader
-|-- loss_functions.py            # Dice, clDice, edge, connectivity, and OHEM losses
+|-- loss_functions.py            # Dice, soft clDice, and edge losses
 |-- metrics.py                   # Region, surface, connectivity, and topology metrics
 |-- options.py                   # Training arguments
 |-- train.py                     # Training and evaluation entry point
@@ -115,6 +115,9 @@ python conversion_and_visualize.py
 - Random seeds are set in `train.py` from `-seed`.
 - cuDNN deterministic mode is enabled in `train.py`.
 - The default evaluation threshold is `--eval_thr 0.5`.
+- USkelCtrlNet uses the same native-resolution input path as DSCNet and SwinSnake. Other comparison models retain the existing loader rule that selects 512x512 resizing where applicable.
+- The staged objective is `alpha * Dice + beta * soft clDice + gamma * edge BCE`, with weights `(0.7, 0.25, 0.05)`, `(0.6, 0.3, 0.1)`, and `(0.5, 0.4, 0.1)` in the early, middle, and late phases. No OHEM term is used.
+- Every encoder stage applies deformable GridSample alignment before its resolution-selected attention. Stages 0-1 use shifted-window attention and stages 2-3 use axial attention.
 - Use the complete OCTA-500 dataset and the split above for experiment-level reproduction.
 
 ## Acknowledgements

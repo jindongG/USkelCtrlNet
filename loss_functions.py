@@ -76,8 +76,22 @@ class clDiceLoss(torch.nn.Module):
         return dice_loss.mean()
 
     def forward(self, pred, target):
-        # Weighted combination as in original paper/version: 0.8 dice + 0.2 clDice
-        return 0.8 * self.dice_loss(pred, target) + 0.2 * self.soft_cldice_loss(pred, target)
+        # The staged objective applies its own alpha/beta weights to Dice and
+        # soft clDice separately.  The 0.8/0.2 mixture is reserved for the
+        # Fixed-loss ablation uses the mixture explicitly below.
+        return self.soft_cldice_loss(pred, target)
+
+
+class FixedDiceClDiceLoss(torch.nn.Module):
+    """Fixed-loss ablation: 0.8 Dice + 0.2 soft clDice."""
+
+    def __init__(self):
+        super().__init__()
+        self.dice = DiceLoss()
+        self.cldice = clDiceLoss()
+
+    def forward(self, pred, target):
+        return 0.8 * self.dice(pred, target) + 0.2 * self.cldice(pred, target)
 
 
 # ------------------------
@@ -110,57 +124,19 @@ def edge_bce_between_pred_and_gt(pred_prob, gt_mask, edge_thresh=0.05):
 
 
 # ------------------------
-# Connectivity proxy losses
-#   - local_connectivity_loss: penalize high predicted pixel with low neighborhood mean
-#   - small_component_loss: penalize small isolated components via opening approx
-# ------------------------
-def local_connectivity_loss(pred, kernel_size=7):
-    # pred: (B,1,H,W) probabilities
-    pad = kernel_size // 2
-    device = pred.device
-    weight = torch.ones((1, 1, kernel_size, kernel_size), device=device)
-    sum_local = F.conv2d(pred, weight, padding=pad)
-    mean_local = sum_local / (kernel_size * kernel_size)
-    loss_map = pred * (1.0 - mean_local)
-    return loss_map.mean()
-
-
-def soft_erode(pred, kernel_size=3, iterations=1):
-    # same as in clDice class but standalone
-    x = pred
-    for _ in range(iterations):
-        x = -F.max_pool2d(-x, kernel_size, stride=1, padding=kernel_size // 2)
-    return x
-
-
-def small_component_loss(pred, kernel_size=3, iters=1):
-    # opening (erode then dilate), penalize removed pixels (small components)
-    eroded = soft_erode(pred, kernel_size=kernel_size, iterations=iters)
-    # dilate (approx by -max_pool on negated)
-    dilated = -F.max_pool2d(-eroded, kernel_size, stride=1, padding=kernel_size // 2)
-    diff = (pred - dilated).clamp(min=0.0)
-    return diff.mean()
-
-
-def connectivity_loss(pred, lam_local=1.0, lam_small=0.5):
-    return lam_local * local_connectivity_loss(pred) + lam_small * small_component_loss(pred)
-
-
-# ------------------------
 # Total loss composition
 # ------------------------
 class TotalVesselLoss(torch.nn.Module):
     """
-    Combines Dice, clDice, edge loss, connectivity proxy.
-    alpha * Dice + beta * clDice + gamma * EdgeBCE + delta * Connectivity
+    Training objective:
+        alpha * Dice + beta * soft clDice + gamma * edge BCE
     """
 
-    def __init__(self, alpha=0.5, beta=0.3, gamma=0.1, delta=0.1):
+    def __init__(self, alpha=0.5, beta=0.3, gamma=0.1):
         super(TotalVesselLoss, self).__init__()
         self.alpha = alpha
         self.beta = beta
         self.gamma = gamma
-        self.delta = delta
         self.dice = DiceLoss()
         self.cldice = clDiceLoss()
 
@@ -175,34 +151,6 @@ class TotalVesselLoss(torch.nn.Module):
         Ldice = self.dice(pred_prob, gt_mask)
         Lcl = self.cldice(pred_prob, gt_mask)
         Ledge = edge_bce_between_pred_and_gt(pred_prob, gt_mask)
-        Lconn = connectivity_loss(pred_prob)
-        total = self.alpha * Ldice + self.beta * Lcl + self.gamma * Ledge + self.delta * Lconn
-        return total, dict(dice=Ldice, cldice=Lcl, edge=Ledge, conn=Lconn)
-
-
-# ------------------------
-# OHEM utility (pixel-level)
-# ------------------------
-def pixel_ohem_loss_from_logits(pred_logits, gt_mask, top_percent=0.3):
-    """
-    pred_logits: (B,1,H,W) logits (before sigmoid)
-    gt_mask: (B,1,H,W) binary float
-    Returns mean BCE over top-k hardest pixels per image.
-    """
-    pred_prob = torch.sigmoid(pred_logits)
-    bce_per_pixel = F.binary_cross_entropy(pred_prob, gt_mask, reduction='none')  # (B,1,H,W)
-    b, _, h, w = bce_per_pixel.shape
-    flat = bce_per_pixel.view(b, -1)
-    k = max(1, int(top_percent * flat.size(1)))
-    topk_vals, _ = torch.topk(flat, k, dim=1)
-    return topk_vals.mean()
-
-
-def pixel_ohem_loss_from_prob(pred_prob, gt_mask, top_percent=0.3):
-    bce_per_pixel = F.binary_cross_entropy(pred_prob, gt_mask, reduction='none')  # (B,1,H,W)
-    b, _, h, w = bce_per_pixel.shape
-    flat = bce_per_pixel.view(b, -1)
-    k = max(1, int(top_percent * flat.size(1)))
-    topk_vals, _ = torch.topk(flat, k, dim=1)
-    return topk_vals.mean()
+        total = self.alpha * Ldice + self.beta * Lcl + self.gamma * Ledge
+        return total, dict(dice=Ldice, cldice=Lcl, edge=Ledge)
 

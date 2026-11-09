@@ -49,11 +49,8 @@ class TrainManager:
         self.total_loss_module = TotalVesselLoss(
             alpha=args.alpha,
             beta=args.beta,
-            gamma=args.gamma,
-            delta=args.delta
+            gamma=args.gamma
         )
-        self.ohem_weight = args.ohem_weight
-        self.ohem_top_percent = args.ohem_top_percent
         self.inputs_process = lambda x: x.to(torch.float).to(device)
 
         # Define full evaluation metric list
@@ -197,28 +194,22 @@ class TrainManager:
             self.model.train()
             total_epoch_loss = 0
 
-            # Dynamic loss weighting strategy
             if epoch <= warmup_epochs:
-                self.total_loss_module.alpha, self.total_loss_module.beta = 0.7, 0.3
-                self.total_loss_module.gamma, self.total_loss_module.delta = 0.05, 0
-                ohem_weight = 0.0
+                self.total_loss_module.alpha, self.total_loss_module.beta = 0.7, 0.25
+                self.total_loss_module.gamma = 0.05
             elif epoch <= args.epochs * 0.5:
                 self.total_loss_module.alpha, self.total_loss_module.beta = 0.6, 0.3
-                self.total_loss_module.gamma, self.total_loss_module.delta = 0.1, 0
-                ohem_weight = 0.5
+                self.total_loss_module.gamma = 0.1
             else:
                 self.total_loss_module.alpha, self.total_loss_module.beta = 0.5, 0.4
-                self.total_loss_module.gamma, self.total_loss_module.delta = 0.1, 0
-                ohem_weight = 0.7
+                self.total_loss_module.gamma = 0.1
 
             for samples, labels, _ in train_loader:
                 samples, labels = map(self.inputs_process, (samples, labels))
                 self.optimizer.zero_grad()
                 preds = self.model(samples)
                 pred_prob = self._ensure_prob(preds)
-                main_loss_val, _ = self.total_loss_module(pred_prob, labels)
-                ohem_loss = pixel_ohem_loss_from_prob(pred_prob, labels, top_percent=self.ohem_top_percent)
-                total_loss = main_loss_val + ohem_weight * ohem_loss
+                total_loss, _ = self.total_loss_module(pred_prob, labels)
                 total_loss.backward()
                 self.optimizer.step()
                 total_epoch_loss += total_loss.item()
@@ -388,7 +379,7 @@ if __name__ == "__main__":
         "repeat_n": args.repeat_n,
         "save_weight": args.save_weight
     }
-    is_resize = not ("SwinSnake" in model_dct["name"] or "DSCNet" in model_dct["name"])
+    is_resize = not any(tag in model_dct["name"] for tag in ("SwinSnake", "DSCNet", "USkelCtrl"))
     dataloader_producer = DataLoader_Producer(
         fov=args.fov,
         label_type=args.label_type,
