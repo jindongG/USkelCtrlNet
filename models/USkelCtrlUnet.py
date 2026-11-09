@@ -495,20 +495,11 @@ class MultiView_DSConv(nn.Module):
 
 
 # -------------------------
-# Deformable Window wrapper (S1): compute small per-pixel offset field, warp feature map, then call shifted_window_attention.
-# This is simpler and stable to train.
+# Shared deformable alignment used before window or axial attention.
 # -------------------------
-class DeformableWindowAttention(nn.Module):
-    def __init__(self, dim: int, window_size: List[int], shift_size: List[int], num_heads: int,
-                 offset_scale: float = 0.125, qkv_bias: bool = True, proj_bias: bool = True,
-                 attention_dropout: float = 0.0, dropout: float = 0.0):
-        """
-        offset_scale: maximum relative offset (in pixels) scaled by feature map size; small value (0.1~0.2) is recommended
-        """
+class DeformableWarp(nn.Module):
+    def __init__(self, dim: int, offset_scale: float = 0.125):
         super().__init__()
-        # embed underlying shifted window attention (kept)
-        self.inner_attn = ShiftedWindowAttention(dim, window_size, shift_size, num_heads, qkv_bias, proj_bias, attention_dropout, dropout)
-        # small conv to predict 2-channel offset field (dx, dy) in pixel units (not normalized)
         self.offset_conv = nn.Conv2d(dim, 2, kernel_size=3, padding=1)
         nn.init.constant_(self.offset_conv.weight, 0.0)
         nn.init.constant_(self.offset_conv.bias, 0.0)
@@ -526,7 +517,11 @@ class DeformableWindowAttention(nn.Module):
         offset = torch.tanh(offset) * (self.offset_scale * min(H, W))
         # create normalized sampling grid then add offsets and grid_sample
         # grid_sample expects normalized coords in [-1,1]; build base grid:
-        yy, xx = torch.meshgrid(torch.linspace(-1, 1, H, device=x.device), torch.linspace(-1, 1, W, device=x.device), indexing='ij')
+        yy, xx = torch.meshgrid(
+            torch.linspace(-1, 1, H, device=x.device, dtype=x.dtype),
+            torch.linspace(-1, 1, W, device=x.device, dtype=x.dtype),
+            indexing='ij'
+        )
         base_grid = torch.stack((xx, yy), dim=-1)  # H W 2
         base_grid = base_grid.unsqueeze(0).expand(B, -1, -1, -1).contiguous()  # B H W 2
         # convert pixel offset to normalized offsets: offset_px / (W-1)/ (H-1) scaled accordingly
@@ -539,25 +534,52 @@ class DeformableWindowAttention(nn.Module):
         warped_grid = base_grid + norm_offset  # B H W 2
         # grid_sample expects NCHW input and grid shape N H W 2 (x,y)
         warped = F.grid_sample(x_nchw, warped_grid, mode='bilinear', padding_mode='zeros', align_corners=True)
-        # convert back NHWC
-        warped_nhwc = warped.permute(0, 2, 3, 1).contiguous()
-        # now call shifted-window attention on warped features (this preserves Swin behavior)
-        return self.inner_attn(warped_nhwc)
+        return warped.permute(0, 2, 3, 1).contiguous()
+
+
+class DeformableWindowAttention(nn.Module):
+    """Warp followed by shifted-window attention."""
+    def __init__(self, dim: int, window_size: List[int], shift_size: List[int], num_heads: int,
+                 qkv_bias: bool = True, proj_bias: bool = True,
+                 attention_dropout: float = 0.0, dropout: float = 0.0,
+                 offset_scale: float = 0.125):
+        super().__init__()
+        self.warp = DeformableWarp(
+            dim, offset_scale=offset_scale
+        )
+        self.inner_attn = ShiftedWindowAttention(
+            dim, window_size, shift_size, num_heads,
+            qkv_bias, proj_bias, attention_dropout, dropout
+        )
+
+    def forward(self, x: torch.Tensor):
+        return self.inner_attn(self.warp(x))
+
+
+class DeformableAxialAttention(nn.Module):
+    """Warp followed by low-resolution axial attention."""
+    def __init__(self, dim: int, num_heads: int, offset_scale: float = 0.125):
+        super().__init__()
+        self.warp = DeformableWarp(dim, offset_scale=offset_scale)
+        self.inner_attn = AxialAttention(dim, num_heads=num_heads)
+
+    def forward(self, x: torch.Tensor):
+        return self.inner_attn(self.warp(x))
 
 
 # -------------------------
-# Deformable SwinLayer wrapper (uses DeformableWindowAttention)
+# Deformable attention wrapper (window or axial attention after shared warp)
 # -------------------------
 class DeformableSwinLayer(nn.Module):
     def __init__(self, channels=36, is_shift=1, use_axial=False):
         super().__init__()
 
         if use_axial:
-            # Low-resolution: global axial attention
+            # Low-resolution: warp first, then global axial attention.
             attn_layer = lambda dim, window, shift, heads, **kw: \
-                AxialAttention(dim, num_heads=heads)
+                DeformableAxialAttention(dim, num_heads=heads)
         else:
-            # High-resolution: window directional + deformable warp
+            # High-resolution: warp first, then shifted-window attention.
             attn_layer = lambda dim, window, shift, heads, qkv_bias=True, proj_bias=True, attention_dropout=0.0, dropout=0.0: \
                 DeformableWindowAttention(
                     dim, window, shift, heads,
@@ -770,8 +792,9 @@ class USkelCtrlUnet(nn.Module):
             [AttentionProbe(ch) for ch in out_channels]
         )
 
-        # Deformable swin blocks for each stage
-        # Hybrid: stage 0,1 use window directional; stage 2,3,4 use axial
+        # Deformable attention blocks for the encoder stages.  With the
+        # With depth=4, stages 0-1 are windowed and stages 2-3 are axial;
+        # all stages include the shared warp operation.
         self.swins = nn.ModuleList()
         for i, out_ch in enumerate(out_channels):
             use_axial = (i >= 2)  # stage 2+ use axial attention
@@ -835,8 +858,8 @@ class USkelCtrlUnet(nn.Module):
             feat = torch.cat([feat, enc_feats[i]], dim=1)
 
             # ★ skeleton-guided decoder gating（关键）
-            gate = torch.sigmoid(enc_skels[i])  # B,1,H,W
-            feat = feat * (1 + gate)
+            # enc_skels are the already-Sigmoid S_l maps produced by SSC.
+            feat = feat * (1 + enc_skels[i])
 
             idx = 2 * (layer_depth - 1) - i
             if idx < len(self.dsconvs):
